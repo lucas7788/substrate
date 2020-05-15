@@ -135,6 +135,9 @@ use sp_runtime::{
 	generic::{CheckedExtrinsic, UncheckedExtrinsic},
 };
 use crate::dispatch::{DispatchErrorWithPostInfo, DispatchError};
+use sp_runtime::traits::SaturatedConversion;
+use sp_arithmetic::traits::{BaseArithmetic, Saturating};
+use sp_std::{convert::TryFrom, vec::Vec};
 
 /// Re-export priority as type
 pub use sp_runtime::transaction_validity::TransactionPriority;
@@ -519,6 +522,61 @@ impl RuntimeDbWeight {
 		let read_weight = self.read.saturating_mul(r);
 		let write_weight = self.write.saturating_mul(w);
 		read_weight.saturating_add(write_weight)
+	}
+}
+
+fn compact_polynomial(polynomial: &[i64]) -> impl Iterator<Item=(u8, &i64)> {
+	polynomial
+		.iter()
+		.enumerate()
+		.filter_map(|(i, w)| {
+			let i = u8::try_from(i).ok()?;
+			if w == &0 {
+				None
+			} else {
+				Some((i, w))
+			}
+		})
+}
+
+pub trait WeightToFeePolynomial {
+	type Balance: BaseArithmetic;
+
+	fn polynomial() -> &'static [i64];
+
+	fn compact_polynomial() -> Vec<(u8, i64)> {
+		compact_polynomial(Self::polynomial()).map(|(i, w)| (i, *w)).collect()
+	}
+
+	fn calc(weight: &Weight) -> Self::Balance {
+		compact_polynomial(Self::polynomial())
+			.fold(Self::Balance::saturated_from(0u32), |acc, (degree, coeff)| {
+				let x = Self::Balance::saturated_from(*weight).saturating_pow(degree.into());
+				let abs_coeff = Self::Balance::saturated_from(
+					coeff.checked_abs().unwrap_or(i64::max_value()) as u64
+				);
+				let term = abs_coeff.saturating_mul(x);
+
+				if *coeff > 0 {
+					acc.saturating_add(term)
+				} else {
+					acc.saturating_sub(term)
+				}
+			})
+	}
+}
+
+static IDENTITY_POLYNOMIAL: [i64; 2] = [0, 1];
+
+pub struct IdentityFee<T>(sp_std::marker::PhantomData<T>);
+
+impl<T> WeightToFeePolynomial for IdentityFee<T> where
+	T: BaseArithmetic
+{
+	type Balance = T;
+
+	fn polynomial() -> &'static [i64] {
+		&IDENTITY_POLYNOMIAL
 	}
 }
 

@@ -37,7 +37,9 @@ use codec::{Encode, Decode};
 use frame_support::{
 	decl_storage, decl_module, decl_event,
 	traits::{Currency, Get, OnUnbalanced, ExistenceRequirement, WithdrawReason, Imbalance},
-	weights::{Weight, DispatchInfo, PostDispatchInfo, GetDispatchInfo, Pays},
+	weights::{
+		Weight, DispatchInfo, PostDispatchInfo, GetDispatchInfo, Pays, WeightToFeePolynomial,
+	},
 	dispatch::DispatchResult,
 };
 use sp_runtime::{
@@ -76,7 +78,7 @@ pub trait Trait: frame_system::Trait {
 	type TransactionByteFee: Get<BalanceOf<Self>>;
 
 	/// Convert a weight value into a deductible fee based on the currency type.
-	type WeightToFee: Convert<Weight, BalanceOf<Self>>;
+	type WeightToFee: WeightToFeePolynomial<Balance=BalanceOf<Self>>;
 
 	/// Update the multiplier of the next block, based on the previous block's weight.
 	type FeeMultiplierUpdate: Convert<Multiplier, Multiplier>;
@@ -99,6 +101,9 @@ decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
 		/// The fee to be paid for making a transaction; the per-byte portion.
 		const TransactionByteFee: BalanceOf<T> = T::TransactionByteFee::get();
+
+		/// The polynomial that is applied in order to derive fee from weight.
+		const WeightToFee: Vec<(u8, i64)> = T::WeightToFee::compact_polynomial();
 
 		fn deposit_event() = default;
 
@@ -201,7 +206,7 @@ impl<T: Trait> Module<T> {
 		// cap the weight to the maximum defined in runtime, otherwise it will be the
 		// `Bounded` maximum of its data type, which is not desired.
 		let capped_weight = weight.min(<T as frame_system::Trait>::MaximumBlockWeight::get());
-		T::WeightToFee::convert(capped_weight)
+		T::WeightToFee::calc(&capped_weight)
 	}
 }
 
@@ -336,7 +341,9 @@ mod tests {
 	use codec::Encode;
 	use frame_support::{
 		impl_outer_dispatch, impl_outer_origin, parameter_types,
-		weights::{DispatchClass, DispatchInfo, PostDispatchInfo, GetDispatchInfo, Weight},
+		weights::{DispatchClass, DispatchInfo, PostDispatchInfo, GetDispatchInfo, Weight,
+			IdentityFee
+		},
 	};
 	use pallet_balances::Call as BalancesCall;
 	use pallet_transaction_payment_rpc_runtime_api::RuntimeDispatchInfo;
@@ -420,7 +427,6 @@ mod tests {
 	}
 	thread_local! {
 		static TRANSACTION_BYTE_FEE: RefCell<u64> = RefCell::new(1);
-		static WEIGHT_TO_FEE: RefCell<u64> = RefCell::new(1);
 	}
 
 	pub struct TransactionByteFee;
@@ -428,19 +434,12 @@ mod tests {
 		fn get() -> u64 { TRANSACTION_BYTE_FEE.with(|v| *v.borrow()) }
 	}
 
-	pub struct WeightToFee(u64);
-	impl Convert<Weight, u64> for WeightToFee {
-		fn convert(t: Weight) -> u64 {
-			WEIGHT_TO_FEE.with(|v| *v.borrow() * (t as u64))
-		}
-	}
-
 	impl Trait for Runtime {
 		type Event = ();
 		type Currency = pallet_balances::Module<Runtime>;
 		type OnTransactionPayment = ();
 		type TransactionByteFee = TransactionByteFee;
-		type WeightToFee = WeightToFee;
+		type WeightToFee = IdentityFee<BalanceOf<Self>>;
 		type FeeMultiplierUpdate = ();
 	}
 
@@ -452,7 +451,6 @@ mod tests {
 		balance_factor: u64,
 		base_weight: u64,
 		byte_fee: u64,
-		weight_to_fee: u64
 	}
 
 	impl Default for ExtBuilder {
@@ -461,7 +459,6 @@ mod tests {
 				balance_factor: 1,
 				base_weight: 0,
 				byte_fee: 1,
-				weight_to_fee: 1,
 			}
 		}
 	}
@@ -475,10 +472,6 @@ mod tests {
 			self.byte_fee = byte_fee;
 			self
 		}
-		pub fn weight_fee(mut self, weight_to_fee: u64) -> Self {
-			self.weight_to_fee = weight_to_fee;
-			self
-		}
 		pub fn balance_factor(mut self, factor: u64) -> Self {
 			self.balance_factor = factor;
 			self
@@ -486,7 +479,6 @@ mod tests {
 		fn set_constants(&self) {
 			EXTRINSIC_BASE_WEIGHT.with(|v| *v.borrow_mut() = self.base_weight);
 			TRANSACTION_BYTE_FEE.with(|v| *v.borrow_mut() = self.byte_fee);
-			WEIGHT_TO_FEE.with(|v| *v.borrow_mut() = self.weight_to_fee);
 		}
 		pub fn build(self) -> sp_io::TestExternalities {
 			self.set_constants();
@@ -678,7 +670,6 @@ mod tests {
 		let len = ext.len() as u32;
 		ExtBuilder::default()
 			.base_weight(5)
-			.weight_fee(2)
 			.build()
 			.execute_with(||
 		{
@@ -691,10 +682,10 @@ mod tests {
 					weight: info.weight,
 					class: info.class,
 					partial_fee:
-						5 * 2 /* base * weight_fee */
+						5 * 1 /* base * weight_fee */
 						+ (
 							len as u64 /* len * 1 */
-							+ info.weight.min(MaximumBlockWeight::get()) as u64 * 2 /* weight * weight_to_fee */
+							+ info.weight.min(MaximumBlockWeight::get()) as u64 * 1 /* weight * weight_to_fee */
 						) * 3 / 2
 				},
 			);
